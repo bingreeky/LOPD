@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.vscode/
+.idea/
+*.swp
+*.swo
+results/

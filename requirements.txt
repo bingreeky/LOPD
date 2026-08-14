@@ -1,0 +1,14 @@
+torch>=2.4.0
+transformers>=4.45.0
+safetensors>=0.4.0
+accelerate>=1.0.0
+peft>=0.12.0
+pyyaml>=6.0
+numpy>=1.24.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+faiss-cpu>=1.8.0
+sentence-transformers>=3.0.0
+kernels>=0.12.0,<0.13.0
+sglang[all]>=0.5.13
+vllm>=0.6.0

@@ -1,0 +1,25 @@
+llm:
+  type: sglang
+  model_path: YOUR_MODEL_PATH
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 20
+  max_tokens: 10000
+  max_retries: 2
+  enable_thinking: true
+  tp_size: 8
+  dtype: bfloat16
+  mem_fraction_static: 0.8
+  disable_radix_cache: true
+  enable_memory_saver: true
+  sampling_seed: 42
+
+run:
+  result_dir: results/envscaler_eval200
+
+datasets:
+  envscaler:
+    rl_scenario_path: YOUR_EVAL_SCENARIO_PATH
+    env_meta_path: YOUR_ENV_META_PATH
+    max_steps: 30
+    concurrency: 32
