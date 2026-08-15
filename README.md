@@ -1,3 +1,5 @@
+
+
 # LOPD: Latent On-Policy Self-Distillation
 
 **Guibin Zhang\*, Jiayang Lyu\*, Ran Sun, Xinlei Yu, Haoyu Zhao, Qibing Ren†, Shuicheng Yan†**
@@ -27,6 +29,8 @@ pip install -r requirements.txt
 ```
 
 ## Quick Start
+
+Before running, replace placeholder values such as `YOUR_MODEL_PATH` in the selected YAML config with your local paths.
 
 ### Normal Inference
 
