@@ -1,79 +1,56 @@
+import json
 import logging
+import os
 
 import yaml
 
-from backends import BaseLLM, SGLangLLM
-
-try:
-    from backends import VLLMLlm
-except ImportError:
-    VLLMLlm = None
+from backends import BaseLLM, SGLangLLM, VLLMLlm
 
 logger = logging.getLogger(__name__)
 
 
 def load_config(path: str) -> dict:
-    candidate_paths = [path]
-    if "/" not in path and "\\" not in path:
-        candidate_paths.extend([
-            f"configs/{path}",
-            f"configs/inference/{path}",
-            f"configs/training/{path}",
-        ])
-
-    for candidate in candidate_paths:
-        try:
-            with open(candidate) as f:
-                return yaml.safe_load(f)
-        except FileNotFoundError:
-            continue
-
-    raise FileNotFoundError(
-        f"Config file not found: {path}. Tried: {candidate_paths}"
-    )
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def build_llm_from_config(config: dict) -> BaseLLM:
+def build_llm_from_config(
+    config: dict,
+    *,
+    encoder_adapter: tuple[str, str] | None = None,
+    latent_prompt_protocol: str | None = None,
+) -> BaseLLM:
     cfg = config["llm"]
     llm_type = cfg.get("type", "sglang")
+    lora_kwargs = _engine_lora_kwargs(encoder_adapter)
 
     if llm_type == "sglang":
-        lora_cfg = config.get("lora", {})
         return SGLangLLM(
             model_path=cfg["model_path"],
+            latent_prompt_protocol=latent_prompt_protocol,
             temperature=cfg.get("temperature", 0.6),
             max_tokens=cfg.get("max_tokens", 4096),
             max_retries=cfg.get("max_retries", 2),
             enable_thinking=cfg.get("enable_thinking"),
             top_p=cfg.get("top_p", 0.95),
             top_k=cfg.get("top_k", 20),
-            min_p=cfg.get("min_p", 0.0),
             tp_size=cfg.get("tp_size", 1),
-            dp_size=cfg.get("dp_size", 1),
             dtype=cfg.get("dtype", "bfloat16"),
             mem_fraction_static=cfg.get("mem_fraction_static", 0.8),
             disable_radix_cache=cfg.get("disable_radix_cache", True),
             enable_memory_saver=cfg.get("enable_memory_saver", False),
-            enable_weights_cpu_backup=cfg.get("enable_weights_cpu_backup", False),
             enable_return_hidden_states=cfg.get("enable_return_hidden_states", False),
-            enable_lora=cfg.get("enable_lora", bool(lora_cfg.get("enabled", False))),
-            max_lora_rank=cfg.get("max_lora_rank", lora_cfg.get("rank")),
-            lora_target_modules=cfg.get("lora_target_modules", lora_cfg.get("target_modules")),
-            lora_paths=cfg.get("lora_paths"),
-            max_loras_per_batch=cfg.get("max_loras_per_batch", lora_cfg.get("max_loras_per_batch", 4)),
-            max_loaded_loras=cfg.get("max_loaded_loras", lora_cfg.get("max_loaded_loras", 4)),
+            **lora_kwargs,
             enable_deterministic_inference=cfg.get("enable_deterministic_inference", False),
             sampling_seed=cfg.get("sampling_seed", None),
-            disable_cuda_graph=cfg.get("disable_cuda_graph", False),
-            disable_custom_all_reduce=cfg.get("disable_custom_all_reduce", False),
         )
 
     if llm_type == "vllm":
         if VLLMLlm is None:
             raise ImportError("vllm is not installed. Install it with: pip install vllm")
-        lora_cfg = config.get("lora", {})
         return VLLMLlm(
             model_path=cfg["model_path"],
+            latent_prompt_protocol=latent_prompt_protocol,
             temperature=cfg.get("temperature", 0.6),
             max_tokens=cfg.get("max_tokens", 4096),
             max_retries=cfg.get("max_retries", 2),
@@ -82,7 +59,6 @@ def build_llm_from_config(config: dict) -> BaseLLM:
             top_k=cfg.get("top_k", 20),
             min_p=cfg.get("min_p", 0.0),
             sampling_seed=cfg.get("sampling_seed"),
-            stop=cfg.get("stop"),
             tp_size=cfg.get("tp_size", 1),
             dp_size=cfg.get("dp_size", 1),
             dtype=cfg.get("dtype", "bfloat16"),
@@ -92,43 +68,31 @@ def build_llm_from_config(config: dict) -> BaseLLM:
             enforce_eager=cfg.get("enforce_eager", False),
             enable_prefix_caching=cfg.get("enable_prefix_caching", False),
             enable_chunked_prefill=cfg.get("enable_chunked_prefill"),
-            disable_custom_all_reduce=cfg.get("disable_custom_all_reduce", False),
             distributed_executor_backend=cfg.get("distributed_executor_backend"),
-            compilation_config=cfg.get("compilation_config"),
             enable_sleep_mode=cfg.get("enable_sleep_mode", False),
             weight_transfer_backend=cfg.get("weight_transfer_backend"),
             lifecycle_drain_timeout_s=cfg.get("lifecycle_drain_timeout_s", 300),
-            enable_lora=cfg.get("enable_lora", bool(lora_cfg.get("enabled", False))),
-            max_lora_rank=cfg.get("max_lora_rank", lora_cfg.get("rank")),
-            lora_paths=cfg.get("lora_paths"),
-            max_loaded_loras=cfg.get(
-                "max_loaded_loras", lora_cfg.get("max_loaded_loras", 4),
-            ),
+            enable_lora=lora_kwargs.get("enable_lora", False),
+            max_lora_rank=lora_kwargs.get("max_lora_rank"),
+            lora_paths=lora_kwargs.get("lora_paths"),
             encoder_device=cfg.get("encoder_device", "cuda:0"),
-            encoder_dtype=cfg.get("encoder_dtype"),
         )
 
     raise ValueError(f"Unsupported llm.type: {llm_type!r}. Supported: sglang, vllm")
 
 
-def build_compressor_from_config(config: dict, resume_path: str = None):
-    from memory.compressor import (
-        build_compressor_from_model_config,
-        load_compressor_checkpoint,
-    )
-
-    model_path = config["model_path"]
-    qf_cfg = config.get("qformer", {})
-
-    ckpt = resume_path or qf_cfg.get("checkpoint")
-    if ckpt:
-        logger.info("Resuming compressor from %s", ckpt)
-        qformer, step, dataset_offset = load_compressor_checkpoint(ckpt, device="cuda")
-        return qformer.bfloat16(), step, dataset_offset
-
-    logger.info("Creating compressor from model config: %s", model_path)
-    qformer = build_compressor_from_model_config(model_path, qf_cfg)
-    return qformer.bfloat16(), 0, 0
+def _engine_lora_kwargs(encoder_adapter: tuple[str, str] | None) -> dict:
+    if encoder_adapter is None:
+        return {}
+    name, adapter_dir = encoder_adapter
+    with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as f:
+        adapter_config = json.load(f)
+    return {
+        "enable_lora": True,
+        "max_lora_rank": int(adapter_config["r"]),
+        "lora_target_modules": list(adapter_config["target_modules"]),
+        "lora_paths": [{"lora_name": name, "lora_path": adapter_dir, "pinned": True}],
+    }
 
 
 def build_memory_bank_from_config(config: dict):

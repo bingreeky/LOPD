@@ -15,6 +15,7 @@
 
 ## Updates
 
+- **2026-09-22**: Core LOPD training pipeline released. More artifacts, including compressor checkpoints, are on the way.
 - **2026-08-14**: Initial code release. Training code coming soon — integrating the latent memory mechanism into the training pipeline involves substantial complexity and will be released separately.
 
 ## Installation
@@ -40,18 +41,30 @@ python -m inference.run --config configs/inference/envscaler/envscaler_eval200_q
 python -m inference.run_with_latent --config configs/inference/envscaler/envscaler_latent_eval200_qwen3_4b.yaml
 ```
 
+### Compressor Cold-Start
+
+```bash
+python -m training.compressor --config configs/training/compressor_sft_qwen3_4b_envscaler.yaml
+```
+
+### LOPD Training
+
+```bash
+python -m training.lopd --config configs/training/lopd_qwen3_4b_envscaler.yaml
+```
+
 ## Repository Structure
 
 ```
 LOPD/
-├── interaction/  # ReAct agent, episode runner, inference spec
+├── interaction/  # ReAct agent and episode runner
 ├── envs/         # Environment implementations (EnvScaler)
-├── backends/     # LLM inference backends (SGLang, vLLM)
-├── memory/       # Latent memory: QFormer, FAISS bank, compression
+├── backends/     # Inference engines (SGLang, vLLM)
+├── memory/       # Latent composer: encoder LoRA, QFormer, FAISS bank, compressor cold-start
+├── lopd/         # LOPD training: rollout, teacher, worker phases, trainer
+├── training/     # Training entry points
 ├── inference/    # Inference entry points and rollout
-├── utils/        # Tools: build bank, create/merge LoRA
-├── config.py     # Configuration loading and builder functions
-└── configs/      # YAML configuration templates
+└── configs/      # YAML templates (inference and training) and config loading
 ```
 
 ## Results

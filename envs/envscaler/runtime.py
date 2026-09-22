@@ -1,19 +1,15 @@
-
 from __future__ import annotations
 
-import ast
 import json
-import math
 import re
 import types
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 
-
 def init_env_class(env_class_code: str, env_class_name: str):
     module = types.ModuleType("dynamic_env")
-    exec(env_class_code, module.__dict__)  # noqa: S102 - trusted dataset code
+    exec(env_class_code, module.__dict__)
     if not hasattr(module, env_class_name):
         raise ValueError(f"Class '{env_class_name}' not found in provided env_class_code.")
     return getattr(module, env_class_name)
@@ -44,17 +40,16 @@ def get_state_info(env_instance) -> dict:
 
 
 def run_check_function(func_code: str, init_state: dict, final_state: dict):
-    safe_globals: Dict[str, Any] = {"__builtins__": __builtins__}
-    safe_globals.update({"initial_state": deepcopy(init_state)})
+    exec_globals: Dict[str, Any] = {"__builtins__": __builtins__, "initial_state": deepcopy(init_state)}
     try:
-        exec(func_code, safe_globals)  # noqa: S102 - trusted dataset code
-        if "check_func" not in safe_globals:
+        exec(func_code, exec_globals)
+        if "check_func" not in exec_globals:
             return False, None, "Function 'check_func' not found."
-        result = safe_globals["check_func"](final_state)
+        result = exec_globals["check_func"](final_state)
         if not isinstance(result, bool):
             return False, None, "Function did not return a boolean."
         return True, result, None
-    except Exception as e:  # noqa: BLE001 - faithful to EnvScaler
+    except Exception as e:
         return False, None, str(e)
 
 
@@ -69,35 +64,7 @@ def calculate_reward(checklist_with_func: List[dict], init_state: dict, final_st
     return round(passed / len(checklist_with_func), 4)
 
 
-
-_TOOL_PROTOCOL_ALIASES = {
-    "qwen3": "qwen3",
-    "qwen3_json": "qwen3",
-    "olmo": "olmo3",
-    "olmo3": "olmo3",
-    "olmo3_pythonic": "olmo3",
-}
-
-
-def normalize_tool_protocol(tool_protocol: str | None) -> str:
-    raw = "qwen3" if tool_protocol is None else str(tool_protocol).strip().lower()
-    try:
-        return _TOOL_PROTOCOL_ALIASES[raw]
-    except KeyError as exc:
-        allowed = ", ".join(sorted(_TOOL_PROTOCOL_ALIASES))
-        raise ValueError(
-            f"Unknown EnvScaler tool_protocol {tool_protocol!r}; expected one of: {allowed}"
-        ) from exc
-
-
-def parse_response(text: str, tool_protocol: str | None = "qwen3"):
-    protocol = normalize_tool_protocol(tool_protocol)
-    if protocol == "olmo3":
-        return _parse_response_olmo3(text)
-    return _parse_response_qwen3(text)
-
-
-def _parse_response_qwen3(text: str):
+def parse_response(text: str):
     parse_success = True
     result: Dict[str, Any] = {"reasoning_content": None, "tool_calls": None, "content": None}
     text = (text or "").strip()
@@ -146,148 +113,19 @@ def _parse_response_qwen3(text: str):
     return parse_success, result
 
 
-_OLMO3_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
-_OLMO3_JSON_NAME_LITERALS = {"null": None, "true": True, "false": False}
-
-
-def _olmo3_literal(node: ast.expr):
-    if isinstance(node, ast.Constant):
-        value = node.value
-        if value is None or isinstance(value, (str, bool, int)):
-            return value
-        if isinstance(value, float) and math.isfinite(value):
-            return value
-        raise ValueError("OLMo3 tool-call arguments must be JSON-safe literal values")
-    if isinstance(node, ast.List):
-        return [_olmo3_literal(item) for item in node.elts]
-    if isinstance(node, ast.Dict):
-        if not all(
-            isinstance(key, ast.Constant) and isinstance(key.value, str)
-            for key in node.keys
-        ):
-            raise ValueError("OLMo3 dict argument keys must be strings")
-        return {
-            key.value: _olmo3_literal(value)
-            for key, value in zip(node.keys, node.values)
-        }
-    if isinstance(node, ast.Name) and node.id in _OLMO3_JSON_NAME_LITERALS:
-        return _OLMO3_JSON_NAME_LITERALS[node.id]
-    if (
-        isinstance(node, ast.UnaryOp)
-        and isinstance(node.op, (ast.USub, ast.UAdd))
-        and isinstance(node.operand, ast.Constant)
-    ):
-        value = _olmo3_literal(node.operand)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return -value if isinstance(node.op, ast.USub) else value
-        raise ValueError("OLMo3 numeric arguments must be finite JSON numbers")
-    raise ValueError("OLMo3 tool-call arguments must be literal values")
-
-
-def _parse_olmo3_function_calls(body: str) -> List[dict]:
-    compact = ", ".join(line.strip() for line in body.splitlines() if line.strip())
-    if not compact:
-        raise ValueError("Empty <function_calls> block")
-    try:
-        parsed = ast.parse(f"[{compact}]", mode="eval").body
-    except SyntaxError as exc:
-        raise ValueError(f"Malformed OLMo3 function call: {exc.msg}") from exc
-    if not isinstance(parsed, ast.List) or not parsed.elts:
-        raise ValueError("OLMo3 output must contain one or more function calls")
-
-    calls: List[dict] = []
-    for item in parsed.elts:
-        if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Name):
-            raise ValueError("OLMo3 output must contain simple function calls")
-        name = item.func.id
-        if not _OLMO3_NAME_RE.fullmatch(name):
-            raise ValueError(f"Invalid OLMo3 function name: {name!r}")
-        if item.args:
-            raise ValueError("OLMo3 function calls require keyword arguments")
-        arguments: Dict[str, Any] = {}
-        for keyword in item.keywords:
-            if keyword.arg is None:
-                raise ValueError("OLMo3 function calls do not support **kwargs")
-            if keyword.arg in arguments:
-                raise ValueError(f"Duplicate OLMo3 argument: {keyword.arg}")
-            arguments[keyword.arg] = _olmo3_literal(keyword.value)
-        calls.append({"function": {"name": name, "arguments": arguments}})
-    return calls
-
-
-def _parse_response_olmo3(text: str):
-    parse_success = True
-    result: Dict[str, Any] = {"reasoning_content": None, "tool_calls": None, "content": None}
-    text = (text or "").strip()
-
-    think_end = None
-    function_search_start = 0
-    explicit_think = re.search(r"<think>\s*(.*?)\s*</think>", text, re.DOTALL | re.IGNORECASE)
-    if explicit_think:
-        result["reasoning_content"] = explicit_think.group(1).strip() or None
-        think_end = explicit_think.end()
-        function_search_start = think_end
-    else:
-        closing = re.search(r"</think>", text, re.IGNORECASE)
-        if closing:
-            result["reasoning_content"] = text[:closing.start()].strip() or None
-            think_end = closing.end()
-            function_search_start = think_end
-        elif re.match(r"\s*<function_calls>", text, re.IGNORECASE):
-            function_search_start = 0
-        elif text == "Task Completed":
-            result["content"] = text
-            return parse_success, result
-        else:
-            parse_success = False
-            result["reasoning_content"] = {"error": "Missing </think> or malformed think block"}
-            result["content"] = ""
-            return parse_success, result
-
-    function_region = text[function_search_start:]
-    function_matches = list(
-        re.finditer(
-            r"<function_calls>\s*(.*?)\s*</function_calls>",
-            function_region,
-            re.DOTALL | re.IGNORECASE,
-        )
-    )
-    if not function_matches:
-        if re.search(r"</?function_calls>", function_region, re.IGNORECASE):
-            parse_success = False
-            result["tool_calls"] = [{"error": "Unclosed or malformed <function_calls> tag"}]
-        result["content"] = text[think_end:].strip() if think_end is not None else text
-        return parse_success, result
-
-    function_match = function_matches[0]
-    absolute_match_start = function_search_start + function_match.start()
-    result["content"] = text[function_search_start:absolute_match_start].strip()
-    try:
-        result["tool_calls"] = _parse_olmo3_function_calls(function_match.group(1))
-    except ValueError as exc:
-        parse_success = False
-        result["tool_calls"] = [{"error": str(exc), "raw": function_match.group(1)}]
-    return parse_success, result
-
-
 def parse_action(struct_response: dict):
     try:
-        if not struct_response.get("content") and struct_response.get("tool_calls"):
+        if struct_response.get("tool_calls"):
             action = deepcopy(struct_response["tool_calls"][0]["function"])
             if isinstance(action.get("arguments"), str):
                 action["arguments"] = json.loads(action["arguments"])
-        elif struct_response.get("content") and not struct_response.get("tool_calls"):
+        elif struct_response.get("content"):
             action = {"name": "chat_with_user", "arguments": {"content": struct_response.get("content")}}
-        elif struct_response.get("content") and struct_response.get("tool_calls"):
-            action = deepcopy(struct_response["tool_calls"][0]["function"])
-            if isinstance(action.get("arguments"), str):
-                action["arguments"] = json.loads(action["arguments"])
         else:
             return False, {}
         return True, action
-    except Exception as e:  # noqa: BLE001
+    except Exception:
         return False, {}
-
 
 
 SYSTEM_PROMPT = (
@@ -338,49 +176,10 @@ def merge_tools_into_system_prompt(system_prompt: Optional[str], tools: Optional
     return "".join(out)
 
 
-OLMO3_FUNCTION_CALLING_PROMPT = (
-    "You are a helpful function-calling AI assistant. You are provided with function "
-    "signatures within <functions></functions> XML tags. Output function calls as "
-    "newline-separated Python-style calls within <function_calls></function_calls> XML "
-    "tags. Use keyword arguments and literal values, and do not make assumptions about "
-    "what values to plug into functions."
-)
-
-
-def serialize_olmo3_functions(tools: Optional[List[dict]]) -> str:
-    if not tools:
-        return "[]"
-    if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
-        raise ValueError("OLMo3 functions must be a list of tool-schema mappings")
-    return json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
-
-
 def build_envscaler_system_prompt(environment_introduction: str,
                                   constraints_rules: List[str],
-                                  tools: List[dict],
-                                  tool_protocol: str | None = "qwen3") -> str:
+                                  tools: List[dict]) -> str:
     intro = construct_env_introduction(environment_introduction, constraints_rules)
-    base = SYSTEM_PROMPT + "\n\n" + intro
-    protocol = normalize_tool_protocol(tool_protocol)
-    if protocol == "olmo3":
-        return OLMO3_FUNCTION_CALLING_PROMPT + "\n\n" + base
-    return merge_tools_into_system_prompt(base, tools)
+    return merge_tools_into_system_prompt(SYSTEM_PROMPT + "\n\n" + intro, tools)
 
 
-def build_envscaler_system_message(environment_introduction: str,
-                                   constraints_rules: List[str],
-                                   tools: List[dict],
-                                   tool_protocol: str | None = "qwen3") -> dict:
-    protocol = normalize_tool_protocol(tool_protocol)
-    message = {
-        "role": "system",
-        "content": build_envscaler_system_prompt(
-            environment_introduction,
-            constraints_rules,
-            tools,
-            tool_protocol=protocol,
-        ),
-    }
-    if protocol == "olmo3":
-        message["functions"] = serialize_olmo3_functions(tools)
-    return message

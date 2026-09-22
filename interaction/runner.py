@@ -8,7 +8,6 @@ from interaction.react import ReActAgent
 @dataclass
 class EpisodeResult:
     task_id: str
-    env_type: str
     instruction: str
     reward: float
     steps: int
@@ -40,7 +39,6 @@ async def run_episode(
 
     return EpisodeResult(
         task_id=info.task_id,
-        env_type=info.env_type,
         instruction=info.instruction,
         reward=reward,
         steps=steps,

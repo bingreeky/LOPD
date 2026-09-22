@@ -1,13 +1,11 @@
-
 from __future__ import annotations
 
-import ast
+import logging
 import asyncio
 import gc
 import hashlib
 import inspect
 import json
-import math
 import os
 import re
 import struct
@@ -21,14 +19,13 @@ from typing import Any, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-try:
-    from memory.serialization import build_latent_injected_ids
-except ImportError:
-    build_latent_injected_ids = None
+from memory.lora import resolve_peft_adapter_dir
+from memory.prompt_protocol import resolve_compressor_prompt_protocol
+from memory.serialization import build_latent_injected_ids, chat_template_kwargs
 
-from .base import BaseLLM
+from .base import DEFAULT_MAX_RETRIES, BaseLLM
 
-_DEFAULT_RETRIES = 2
+logger = logging.getLogger(__name__)
 _UPDATE_MANIFEST_SCHEMA_VERSION = 2
 _UPDATE_MANIFEST_KEYS = frozenset({
     "schema_version",
@@ -80,7 +77,6 @@ class VLLMLifecycleState(str, Enum):
     DRAINING = "DRAINING"
     SLEEPING = "SLEEPING"
     UPDATING = "UPDATING"
-    ENCODING = "ENCODING"
     FAILED = "FAILED"
 
 
@@ -350,30 +346,17 @@ def _load_embed_tokens_cpu(model_path: str) -> torch.nn.Embedding:
     from safetensors import safe_open
 
     model_dir = Path(model_path)
-    candidate_keys = (
-        "model.embed_tokens.weight",
-        "model.language_model.embed_tokens.weight",
-    )
+    key = "model.embed_tokens.weight"
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.exists():
         with index_path.open(encoding="utf-8") as handle:
-            weight_map = json.load(handle)["weight_map"]
-        key = next((name for name in candidate_keys if name in weight_map), None)
-        if key is None:
-            raise KeyError(f"No input embedding key found; tried {candidate_keys}")
-        shard_path = model_dir / weight_map[key]
-        with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
-            weight = handle.get_tensor(key)
+            shard_path = model_dir / json.load(handle)["weight_map"][key]
     else:
-        weights_path = model_dir / "model.safetensors"
-        if not weights_path.exists():
+        shard_path = model_dir / "model.safetensors"
+        if not shard_path.exists():
             raise FileNotFoundError(f"No safetensors checkpoint found in {model_path}")
-        with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
-            available = set(handle.keys())
-            key = next((name for name in candidate_keys if name in available), None)
-            if key is None:
-                raise KeyError(f"No input embedding key found; tried {candidate_keys}")
-            weight = handle.get_tensor(key)
+    with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
+        weight = handle.get_tensor(key)
 
     embedding = torch.nn.Embedding(*weight.shape, _weight=weight.to(torch.bfloat16))
     embedding.requires_grad_(False)
@@ -387,13 +370,13 @@ class VLLMLlm(BaseLLM):
         model_path: str,
         temperature: float = 0.6,
         max_tokens: int = 4096,
-        max_retries: int = _DEFAULT_RETRIES,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         enable_thinking: bool | None = None,
+        latent_prompt_protocol: str | None = None,
         top_p: float = 0.95,
         top_k: int = 20,
         min_p: float = 0.0,
         sampling_seed: int | None = None,
-        stop: list[str] | str | None = None,
         tp_size: int = 1,
         dp_size: int = 1,
         dtype: str = "bfloat16",
@@ -403,31 +386,27 @@ class VLLMLlm(BaseLLM):
         enforce_eager: bool = False,
         enable_prefix_caching: bool = False,
         enable_chunked_prefill: bool | None = None,
-        disable_custom_all_reduce: bool = False,
         distributed_executor_backend: str | None = None,
-        compilation_config: dict | None = None,
         enable_sleep_mode: bool = False,
         weight_transfer_backend: str | None = None,
         lifecycle_drain_timeout_s: int = 300,
         enable_lora: bool = False,
         max_lora_rank: int | None = None,
         lora_paths: list[dict] | dict[str, str] | list[str] | None = None,
-        max_loaded_loras: int = 4,
         encoder_device: str = "cuda:0",
-        encoder_dtype: str | None = None,
     ):
         self.model_path = model_path
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.enable_thinking = enable_thinking
+        self.latent_protocol = None if latent_prompt_protocol is None else resolve_compressor_prompt_protocol(latent_prompt_protocol)
         self.top_p = top_p
         self.top_k = top_k
         self.min_p = min_p
         self.sampling_seed = sampling_seed
-        self.stop = [stop] if isinstance(stop, str) else stop
         self.encoder_device = encoder_device
-        self.encoder_dtype = encoder_dtype or dtype
+        self.encoder_dtype = dtype
         self._sleep_mode_enabled = bool(enable_sleep_mode)
         self._weight_transfer_backend = (
             str(weight_transfer_backend).lower()
@@ -435,8 +414,7 @@ class VLLMLlm(BaseLLM):
         )
         if self._weight_transfer_backend not in (None, "ipc"):
             raise ValueError(
-                "VLLMLlm only permits the audited same-node IPC weight-transfer "
-                f"backend, got {weight_transfer_backend!r}"
+                f"VLLMLlm supports only the same-node IPC weight-transfer backend, got {weight_transfer_backend!r}"
             )
         if self._weight_transfer_backend and not self._sleep_mode_enabled:
             raise ValueError(
@@ -446,12 +424,7 @@ class VLLMLlm(BaseLLM):
             self._weight_transfer_backend == "ipc"
             and os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION") != "1"
         ):
-            raise RuntimeError(
-                "vLLM 0.25 IPC handle transport requires the process-local "
-                "VLLM_ALLOW_INSECURE_SERIALIZATION=1 opt-in. This wrapper never "
-                "sets it globally. Only use an authenticated loopback controller; "
-                "never expose the IPC update endpoint over HTTP."
-            )
+            raise RuntimeError("VLLM_ALLOW_INSECURE_SERIALIZATION=1 is required for IPC weight transfer")
         if (
             not isinstance(lifecycle_drain_timeout_s, int)
             or isinstance(lifecycle_drain_timeout_s, bool)
@@ -479,14 +452,11 @@ class VLLMLlm(BaseLLM):
             "enforce_eager": bool(enforce_eager),
             "enable_prefix_caching": bool(enable_prefix_caching),
             "enable_chunked_prefill": enable_chunked_prefill,
-            "disable_custom_all_reduce": bool(disable_custom_all_reduce),
             "distributed_executor_backend": distributed_executor_backend,
-            "compilation_config": compilation_config,
             "enable_sleep_mode": self._sleep_mode_enabled,
             "seed": sampling_seed,
             "enable_lora": bool(enable_lora),
             "max_lora_rank": max_lora_rank,
-            "max_loras": int(max_loaded_loras),
         }
         self.engine = None
         self._engine_lock = asyncio.Lock()
@@ -500,6 +470,7 @@ class VLLMLlm(BaseLLM):
         self._lora_requests: dict[str, Any] = {}
         self._next_lora_id = 1
         self._parse_preloaded_loras(lora_paths)
+        self._engine_kwargs["max_loras"] = max(1, len(self._adapter_paths))
 
         self._lifecycle_state = VLLMLifecycleState.RUNNING
         self._lifecycle_failure: BaseException | None = None
@@ -540,10 +511,7 @@ class VLLMLlm(BaseLLM):
 
     def _require_sleep_mode(self) -> None:
         if not self._sleep_mode_enabled:
-            raise NotImplementedError(
-                "vLLM hot lifecycle is disabled; set enable_sleep_mode=true "
-                "explicitly to use level-1 sleep/wake"
-            )
+            raise NotImplementedError("enable_sleep_mode is required")
 
     def _require_ipc_weight_transfer(self) -> None:
         self._require_sleep_mode()
@@ -554,10 +522,7 @@ class VLLMLlm(BaseLLM):
 
     def _raise_if_failed(self) -> None:
         if self._lifecycle_state is VLLMLifecycleState.FAILED:
-            raise RuntimeError(
-                "vLLM lifecycle is fail-closed after a previous error; create a "
-                "new VLLMLlm instance after inspecting the original exception"
-            ) from self._lifecycle_failure
+            raise RuntimeError("vLLM lifecycle failed earlier; create a new VLLMLlm") from self._lifecycle_failure
 
     async def _set_lifecycle_state(self, state: VLLMLifecycleState) -> None:
         async with self._lifecycle_condition:
@@ -626,18 +591,9 @@ class VLLMLlm(BaseLLM):
                 self._raise_if_failed()
                 await self._encoder_activity_condition.wait()
             self._raise_if_failed()
-            if (
-                self.engine is not None
-                and self._lifecycle_state is not VLLMLifecycleState.ENCODING
-            ):
-                raise RuntimeError(
-                    "with an initialized vLLM engine, encoder activity is "
-                    "available only inside encoder_phase()"
-                )
-            if self._lifecycle_state not in (
-                VLLMLifecycleState.RUNNING,
-                VLLMLifecycleState.ENCODING,
-            ):
+            if self.engine is not None:
+                raise RuntimeError("encoder activity is available only before the vLLM engine is initialized")
+            if self._lifecycle_state is not VLLMLifecycleState.RUNNING:
                 raise RuntimeError(
                     "encoder activity is unavailable during lifecycle state "
                     f"{self.lifecycle_state}"
@@ -704,83 +660,6 @@ class VLLMLlm(BaseLLM):
                 await self._await_cleanup_completion(
                     _release_encoder_barrier(),
                 )
-
-    async def set_initial_weights_path(self, weights_path: str) -> str:
-        self._raise_if_failed()
-        async with self._lifecycle_condition:
-            if self.engine is not None:
-                raise RuntimeError(
-                    "set_initial_weights_path must run before vLLM engine creation"
-                )
-            if self._active_generations:
-                raise RuntimeError(
-                    "set_initial_weights_path requires no active generation"
-                )
-            if self._lifecycle_state is not VLLMLifecycleState.RUNNING:
-                raise RuntimeError(
-                    "set_initial_weights_path requires RUNNING, got "
-                    f"{self.lifecycle_state}"
-                )
-
-        inventory = await asyncio.to_thread(_checkpoint_inventory, weights_path)
-        prepared_embed = await asyncio.to_thread(
-            _load_embed_tokens_cpu, inventory["weights_path"],
-        )
-
-        async with self._lifecycle_operation_lock:
-            async with self._engine_lock:
-                async with self._encoder_quiescence():
-                    transitioned = False
-                    try:
-                        async with self._lifecycle_condition:
-                            self._raise_if_failed()
-                            if self.engine is not None:
-                                raise RuntimeError(
-                                    "set_initial_weights_path must run before "
-                                    "vLLM engine creation"
-                                )
-                            if self._active_generations:
-                                raise RuntimeError(
-                                    "set_initial_weights_path requires no active "
-                                    "generation"
-                                )
-                            if (
-                                self._lifecycle_state
-                                is not VLLMLifecycleState.RUNNING
-                            ):
-                                raise RuntimeError(
-                                    "set_initial_weights_path requires RUNNING, "
-                                    f"got {self.lifecycle_state}"
-                                )
-                            current_shape = self._embedding_shape(self.embed_layer)
-                            replacement_shape = self._embedding_shape(
-                                prepared_embed,
-                            )
-                            if replacement_shape != current_shape:
-                                raise ValueError(
-                                    "Initial checkpoint cannot change the input "
-                                    "embedding shape: "
-                                    f"current={current_shape}, "
-                                    f"new={replacement_shape}"
-                                )
-                            self._lifecycle_state = VLLMLifecycleState.DRAINING
-                            transitioned = True
-                            self._lifecycle_condition.notify_all()
-
-                        await self._drop_encoder_locked()
-                        self.model_path = inventory["weights_path"]
-                        self._engine_kwargs["model"] = inventory["weights_path"]
-                        self.embed_layer = prepared_embed
-                        await self._set_lifecycle_state(
-                            VLLMLifecycleState.RUNNING,
-                        )
-                    except BaseException as exc:
-                        if transitioned:
-                            await self._await_cleanup_completion(
-                                self._fail_lifecycle(exc),
-                            )
-                        raise
-        return inventory["weights_path"]
 
     @staticmethod
     def _supported_engine_kwargs(engine_args_cls, kwargs: dict) -> dict:
@@ -883,7 +762,6 @@ class VLLMLlm(BaseLLM):
             "top_p": self.top_p,
             "top_k": self.top_k,
             "min_p": self.min_p,
-            "stop": self.stop,
             "seed": self.sampling_seed,
         }
         for key, value in (overrides or {}).items():
@@ -891,59 +769,18 @@ class VLLMLlm(BaseLLM):
             params[mapped] = value
         return SamplingParams(**{key: value for key, value in params.items() if value is not None})
 
-    async def _render_text_prompt(self, messages: list[dict], tools: Optional[list[dict]]):
-        kwargs = {
-            "tools": tools or None,
-            "tokenize": False,
-            "add_generation_prompt": True,
-        }
-        if self.enable_thinking is not None:
-            kwargs["enable_thinking"] = self.enable_thinking
-        try:
-            return await asyncio.to_thread(
-                self.tokenizer.apply_chat_template, messages, **kwargs,
-            )
-        except TypeError as exc:
-            if "enable_thinking" not in kwargs:
-                raise
-            kwargs.pop("enable_thinking")
-            return await asyncio.to_thread(
-                self.tokenizer.apply_chat_template, messages, **kwargs,
-            )
+    async def _render_text_prompt(self, messages: list[dict]):
+        return await asyncio.to_thread(
+            self.tokenizer.apply_chat_template, messages,
+            **chat_template_kwargs(self.enable_thinking, add_generation_prompt=True),
+        )
 
-    def _dummy_token_id(self) -> int:
-        for attr in ("pad_token_id", "eos_token_id", "unk_token_id", "bos_token_id"):
-            token_id = getattr(self.tokenizer, attr, None)
-            if isinstance(token_id, (list, tuple)):
-                token_id = token_id[0] if token_id else None
-            if token_id is not None:
-                return int(token_id)
-        raise ValueError("Tokenizer has no valid placeholder token id")
-
-    async def _build_latent_prompt(
-        self,
-        messages: list[dict],
-        tools: Optional[list[dict]],
-        latent_embeds: torch.Tensor,
-        latent_framing_before: str | None,
-        latent_framing_after: str | None,
-    ) -> dict:
-        inject_kwargs = {
-            "enable_thinking": self.enable_thinking,
-            "add_generation_prompt": True,
-            "placeholder_token_id": self._dummy_token_id(),
-        }
-        if latent_framing_before is not None:
-            inject_kwargs["framing_before"] = latent_framing_before
-        if latent_framing_after is not None:
-            inject_kwargs["framing_after"] = latent_framing_after
-        input_ids, positions, _, _ = await asyncio.to_thread(
-            build_latent_injected_ids,
-            messages,
-            tools,
-            self.tokenizer,
-            int(latent_embeds.shape[0]),
-            **inject_kwargs,
+    async def _build_latent_prompt(self, messages: list[dict], latent_embeds: torch.Tensor) -> dict:
+        if self.latent_protocol is None:
+            raise ValueError("latent injection requires latent_prompt_protocol")
+        input_ids, positions = await asyncio.to_thread(
+            build_latent_injected_ids, messages, self.tokenizer, int(latent_embeds.shape[0]), self.latent_protocol,
+            enable_thinking=self.enable_thinking, add_generation_prompt=True,
         )
         if len(positions) != int(latent_embeds.shape[0]):
             raise ValueError(
@@ -971,23 +808,15 @@ class VLLMLlm(BaseLLM):
     async def __call__(
         self,
         messages: list[dict],
-        tools: Optional[list[dict]] = None,
+        *,
         latent_embeds: Optional[torch.Tensor] = None,
         lora_path: Optional[str] = None,
-        latent_framing_before: Optional[str] = None,
-        latent_framing_after: Optional[str] = None,
     ) -> dict:
         async with self._generation_lease():
             if latent_embeds is None:
-                prompt = await self._render_text_prompt(messages, tools)
+                prompt = await self._render_text_prompt(messages)
             else:
-                prompt = await self._build_latent_prompt(
-                    messages,
-                    tools,
-                    latent_embeds,
-                    latent_framing_before,
-                    latent_framing_after,
-                )
+                prompt = await self._build_latent_prompt(messages, latent_embeds)
             engine = await self._ensure_engine()
             sampling_params = self._sampling_params()
             lora_request = self._resolve_lora_request(lora_path)
@@ -1005,34 +834,17 @@ class VLLMLlm(BaseLLM):
                         final_output = output
                     if final_output is None or not final_output.outputs:
                         raise RuntimeError("vLLM returned no generation output")
-                    return _parse_response(final_output.outputs[0].text)
-                except Exception as exc:  # noqa: BLE001
+                    return {"role": "assistant", "content": final_output.outputs[0].text}
+                except Exception as exc:
                     last_exc = exc
                     if attempt < self.max_retries:
                         wait = 2**attempt
-                        print(
-                            f"\n  [vLLM] {type(exc).__name__}: {exc}, "
-                            f"retrying in {wait}s..."
-                        )
+                        logger.warning("vLLM call failed (%s: %s), retrying in %ds", type(exc).__name__, exc, wait)
                         await asyncio.sleep(wait)
         raise RuntimeError(
             f"vLLM call failed after {self.max_retries + 1} attempts"
         ) from last_exc
 
-
-
-
-    @staticmethod
-    def _resolve_lora_adapter_path(path: str, adapter_name: str) -> str:
-        adapter_dir = Path(path)
-        if (adapter_dir / "adapter_config.json").exists():
-            return str(adapter_dir)
-        nested = adapter_dir / adapter_name
-        if (nested / "adapter_config.json").exists():
-            return str(nested)
-        raise FileNotFoundError(
-            f"Could not find adapter_config.json in {adapter_dir} or {nested}"
-        )
 
     def _parse_preloaded_loras(self, lora_paths) -> None:
         if not lora_paths:
@@ -1052,9 +864,7 @@ class VLLMLlm(BaseLLM):
                 path = entry.get("lora_path") or entry.get("path")
             if not path:
                 raise ValueError(f"Invalid vLLM LoRA preload entry: {entry!r}")
-            self._adapter_paths[str(name)] = self._resolve_lora_adapter_path(
-                str(path), str(name),
-            )
+            self._adapter_paths[str(name)] = resolve_peft_adapter_dir(str(path), str(name))
 
     async def _load_lora_into_engine(self, name: str, path: str):
         if name in self._lora_requests:
@@ -1073,24 +883,6 @@ class VLLMLlm(BaseLLM):
         self._lora_requests[name] = request
         return request
 
-    async def async_load_lora_adapter(
-        self, name: str, path: str, pinned: bool = True,
-    ) -> str:
-        del pinned
-        resolved = self._resolve_lora_adapter_path(path, name)
-        self._adapter_paths[name] = resolved
-        if self.engine is not None:
-            await self._load_lora_into_engine(name, resolved)
-        return resolved
-
-    async def async_unload_lora_adapter(self, name: str) -> None:
-        self._adapter_paths.pop(name, None)
-        request = self._lora_requests.pop(name, None)
-        if request is not None and self.engine is not None:
-            result = await self.engine.remove_lora(request.lora_int_id)
-            if result is False:
-                raise RuntimeError(f"vLLM failed to unload LoRA {name!r}")
-
 
     @staticmethod
     def _torch_dtype(name: str):
@@ -1102,115 +894,10 @@ class VLLMLlm(BaseLLM):
         except KeyError as exc:
             raise ValueError(f"Unsupported encoder dtype: {name}") from exc
 
-    @asynccontextmanager
-    async def encoder_phase(self):
-        self._raise_if_failed()
-        phase_engine = None
-        transitioned = False
-
-        async with self._lifecycle_operation_lock:
-            self._raise_if_failed()
-            phase_engine = self.engine
-            if phase_engine is not None:
-                self._require_sleep_mode()
-
-            async with self._lifecycle_condition:
-                if self._lifecycle_state is not VLLMLifecycleState.RUNNING:
-                    raise RuntimeError(
-                        "encoder_phase cannot overlap another lifecycle phase; "
-                        f"got {self.lifecycle_state}"
-                    )
-                if phase_engine is None and self._active_generations:
-                    raise RuntimeError(
-                        "pre-engine encoder_phase requires no active generation"
-                    )
-                self._lifecycle_state = VLLMLifecycleState.DRAINING
-                transitioned = True
-                self._lifecycle_condition.notify_all()
-
-            try:
-                if phase_engine is not None:
-                    async def _wait_for_generation_leases() -> None:
-                        async with self._lifecycle_condition:
-                            while self._active_generations:
-                                await self._lifecycle_condition.wait()
-
-                    await asyncio.wait_for(
-                        _wait_for_generation_leases(),
-                        timeout=self._lifecycle_drain_timeout_s,
-                    )
-                    if self.engine is not phase_engine:
-                        raise RuntimeError(
-                            "vLLM engine changed while entering encoder_phase"
-                        )
-                    await self._release_encoder()
-                    await phase_engine.wait_for_requests_to_drain(
-                        drain_timeout=self._lifecycle_drain_timeout_s,
-                    )
-                    await phase_engine.sleep(level=1, mode="wait")
-                await self._set_lifecycle_state(VLLMLifecycleState.ENCODING)
-            except BaseException as exc:
-                if transitioned:
-                    await self._await_cleanup_completion(
-                        self._fail_lifecycle(exc),
-                    )
-                raise
-
-        try:
-            yield self
-        finally:
-            async with self._lifecycle_operation_lock:
-                async with self._lifecycle_condition:
-                    if self._lifecycle_state is not VLLMLifecycleState.ENCODING:
-                        raise RuntimeError(
-                            "encoder_phase exit requires ENCODING, got "
-                            f"{self.lifecycle_state}"
-                        )
-                    self._lifecycle_state = VLLMLifecycleState.DRAINING
-                    self._lifecycle_condition.notify_all()
-                try:
-                    async with self._encoder_quiescence(
-                        fail_closed_on_timeout=True,
-                    ):
-                        try:
-                            await self._drop_encoder_locked()
-                            if self.engine is not phase_engine:
-                                raise RuntimeError(
-                                    "vLLM engine changed during encoder_phase"
-                                )
-                            if phase_engine is not None:
-                                await phase_engine.wake_up(tags=["weights"])
-                                await phase_engine.wake_up(
-                                    tags=["kv_cache", "scheduling"],
-                                )
-                            await self._set_lifecycle_state(
-                                VLLMLifecycleState.RUNNING,
-                            )
-                        except BaseException as exc:
-                            await self._await_cleanup_completion(
-                                self._fail_lifecycle(exc),
-                            )
-                            raise
-                except BaseException as exc:
-                    if self._lifecycle_state is not VLLMLifecycleState.FAILED:
-                        await self._await_cleanup_completion(
-                            self._fail_lifecycle(exc),
-                        )
-                    raise
-
     async def _ensure_encoder(self, lora_name: str | None):
-        if (
-            self.engine is not None
-            and self._lifecycle_state is not VLLMLifecycleState.ENCODING
-        ):
-            raise RuntimeError(
-                "with an initialized vLLM engine, encoder hidden states are "
-                "available only inside encoder_phase()"
-            )
-        if self._lifecycle_state not in (
-            VLLMLifecycleState.RUNNING,
-            VLLMLifecycleState.ENCODING,
-        ):
+        if self.engine is not None:
+            raise RuntimeError("encoder hidden states are available only before the vLLM engine is initialized")
+        if self._lifecycle_state is not VLLMLifecycleState.RUNNING:
             raise RuntimeError(
                 "encoder hidden states are unavailable during lifecycle state "
                 f"{self.lifecycle_state}"
@@ -1394,17 +1081,14 @@ class VLLMLlm(BaseLLM):
         keys = frozenset(update_info)
         if keys != _IPC_UPDATE_INFO_KEYS:
             raise ValueError(
-                "IPC update_info keys must match vLLM 0.25 packed IPC exactly; "
+                "IPC update_info keys must match vLLM's packed IPC schema; "
                 f"missing={sorted(_IPC_UPDATE_INFO_KEYS - keys)}, "
                 f"extra={sorted(keys - _IPC_UPDATE_INFO_KEYS)}"
             )
         if update_info["ipc_handles_pickled"] is not None:
-            raise ValueError(
-                "Pickled/HTTP IPC handles are forbidden; pass direct same-node "
-                "ipc_handles through the authenticated loopback controller"
-            )
+            raise ValueError("pickled ipc_handles are not accepted")
         if update_info["packed"] is not True:
-            raise ValueError("Only bounded-memory packed IPC chunks are accepted")
+            raise ValueError("update_info.packed must be true")
 
         names = update_info["names"]
         dtypes = update_info["dtype_names"]
@@ -1521,10 +1205,7 @@ class VLLMLlm(BaseLLM):
     async def resume_gpu(self, weights_path: str | None = None) -> None:
         self._require_sleep_mode()
         if weights_path is not None:
-            raise NotImplementedError(
-                "resume_gpu only supports an unchanged model. Use "
-                "start/apply/finish_weight_update_session for full-model updates."
-            )
+            raise NotImplementedError("resume_gpu does not reload weights; use the weight update session")
         async with self._lifecycle_operation_lock:
             self._raise_if_failed()
             if self._lifecycle_state is VLLMLifecycleState.RUNNING:
@@ -1724,135 +1405,6 @@ class VLLMLlm(BaseLLM):
             )
 
     async def update_weights_from_path(self, weights_path: str) -> None:
-        del weights_path
-        raise NotImplementedError(
-            "Direct path reload remains forbidden. Use the strict full-model "
-            "packed-IPC weight update session API."
-        )
+        raise NotImplementedError("use the weight update session")
 
 
-def _parse_response(text: str) -> dict:
-    return {
-        "role": "assistant",
-        "content": text,
-        "tool_calls": _extract_tool_calls(text),
-    }
-
-
-def _as_openai_tool_call(obj: dict) -> dict | None:
-    function = obj.get("function") if isinstance(obj.get("function"), dict) else obj
-    name = function.get("name") or function.get("function_name")
-    if not name:
-        return None
-    args = function.get("arguments") or function.get("parameters") or {}
-    return {
-        "id": obj.get("id") or f"call_{uuid.uuid4().hex[:8]}",
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args),
-        },
-    }
-
-
-_OLMO3_JSON_NAME_LITERALS = {"null": None, "true": True, "false": False}
-
-
-def _olmo3_ast_literal(node: ast.expr):
-    if isinstance(node, ast.Constant):
-        value = node.value
-        if value is None or isinstance(value, (str, bool, int)):
-            return value
-        if isinstance(value, float) and math.isfinite(value):
-            return value
-        raise ValueError("OLMo3 arguments must be JSON-safe literal values")
-    if isinstance(node, ast.List):
-        return [_olmo3_ast_literal(item) for item in node.elts]
-    if isinstance(node, ast.Dict):
-        if not all(
-            isinstance(key, ast.Constant) and isinstance(key.value, str)
-            for key in node.keys
-        ):
-            raise ValueError("OLMo3 dict keys must be strings")
-        return {
-            key.value: _olmo3_ast_literal(value)
-            for key, value in zip(node.keys, node.values)
-        }
-    if isinstance(node, ast.Name) and node.id in _OLMO3_JSON_NAME_LITERALS:
-        return _OLMO3_JSON_NAME_LITERALS[node.id]
-    if (
-        isinstance(node, ast.UnaryOp)
-        and isinstance(node.op, (ast.USub, ast.UAdd))
-        and isinstance(node.operand, ast.Constant)
-    ):
-        value = _olmo3_ast_literal(node.operand)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return -value if isinstance(node.op, ast.USub) else value
-        raise ValueError("OLMo3 numeric arguments must be finite JSON numbers")
-    raise ValueError("OLMo3 arguments must be literals")
-
-
-def _extract_olmo3_pythonic_calls(raw: str) -> list[dict]:
-    compact = ", ".join(line.strip() for line in raw.splitlines() if line.strip())
-    if not compact:
-        return []
-    try:
-        expression = ast.parse(f"[{compact}]", mode="eval").body
-    except SyntaxError:
-        return []
-    if not isinstance(expression, ast.List):
-        return []
-
-    calls: list[dict] = []
-    try:
-        for item in expression.elts:
-            if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Name) or item.args:
-                return []
-            arguments: dict[str, Any] = {}
-            for keyword in item.keywords:
-                if keyword.arg is None or keyword.arg in arguments:
-                    return []
-                arguments[keyword.arg] = _olmo3_ast_literal(keyword.value)
-            calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": item.func.id,
-                    "arguments": json.dumps(
-                        arguments,
-                        ensure_ascii=False,
-                        allow_nan=False,
-                    ),
-                },
-            })
-    except (TypeError, ValueError):
-        return []
-    return calls
-
-
-def _extract_tool_calls(text: str) -> list[dict] | None:
-    parsed: list[dict] = []
-    for raw in re.findall(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL):
-        try:
-            obj = json.loads(raw.strip())
-        except Exception:
-            continue
-        call = _as_openai_tool_call(obj) if isinstance(obj, dict) else None
-        if call is not None:
-            parsed.append(call)
-
-    for raw in re.findall(r"<function_calls>(.*?)</function_calls>", text, re.DOTALL):
-        pythonic = _extract_olmo3_pythonic_calls(raw)
-        if pythonic:
-            parsed.extend(pythonic)
-            continue
-        try:
-            obj = json.loads(raw.strip())
-        except Exception:
-            continue
-        items = obj if isinstance(obj, list) else [obj]
-        for item in items:
-            call = _as_openai_tool_call(item) if isinstance(item, dict) else None
-            if call is not None:
-                parsed.append(call)
-    return parsed or None

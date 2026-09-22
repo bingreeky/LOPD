@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,39 +11,34 @@ class CompressorPromptProtocol:
     task_prefix_head: str
     task_prefix_tail: str
 
-
-_ALIASES = {
-    "envscaler": "envscaler_v1",
-    "envscaler_v1": "envscaler_v1",
-}
+    def task_prefix(self, task_text: str) -> str:
+        return self.task_prefix_head + task_text.rstrip() + self.task_prefix_tail
 
 
-def resolve_compressor_prompt_protocol(
-    protocol: str | CompressorPromptProtocol | None,
-) -> CompressorPromptProtocol:
+ENVSCALER_V1 = CompressorPromptProtocol(
+    name="envscaler_v1",
+    latent_framing_before=(
+        "The following is a REFERENCE EXAMPLE of how a DIFFERENT, already-solved task was "
+        "handled, shown only to illustrate the general approach. It was performed in a SEPARATE "
+        "session — in YOUR task below, NOTHING has been done yet and the environment is in "
+        "its initial state. You must perform every step yourself by calling the tools and "
+        "reading their actual results; do NOT assume any step is already complete.\n\n"
+    ),
+    latent_framing_after=(
+        "\n\n--- end of reference example ---\n\n"
+        "Now complete YOUR task below, starting from scratch (the environment is untouched):\n\n"
+    ),
+    task_prefix_head="Task to solve:\n",
+    task_prefix_tail="\n\nReference past trajectory:\n",
+)
+
+_PROTOCOLS = {ENVSCALER_V1.name: ENVSCALER_V1}
+
+
+def resolve_compressor_prompt_protocol(protocol: str | CompressorPromptProtocol) -> CompressorPromptProtocol:
     if isinstance(protocol, CompressorPromptProtocol):
         return protocol
-
-    raw_name = "envscaler_v1" if protocol is None else str(protocol).strip().lower()
-    if not raw_name:
-        raw_name = "envscaler_v1"
     try:
-        name = _ALIASES[raw_name]
+        return _PROTOCOLS[str(protocol).strip().lower()]
     except KeyError as exc:
-        allowed = ", ".join(sorted(_ALIASES))
-        raise ValueError(
-            f"Unknown compressor prompt protocol {protocol!r}; expected one of: {allowed}"
-        ) from exc
-
-    if name == "envscaler_v1":
-        from envs.envscaler.prompts import MEMORY_FRAMING_AFTER, MEMORY_FRAMING_BEFORE
-
-        return CompressorPromptProtocol(
-            name=name,
-            latent_framing_before=MEMORY_FRAMING_BEFORE,
-            latent_framing_after=MEMORY_FRAMING_AFTER,
-            task_prefix_head="Task to solve:\n",
-            task_prefix_tail="\n\nReference past trajectory:\n",
-        )
-
-    raise ValueError(f"Protocol {name!r} is registered but has no implementation")
+        raise ValueError(f"Unknown compressor prompt protocol {protocol!r}; expected one of: {', '.join(sorted(_PROTOCOLS))}") from exc

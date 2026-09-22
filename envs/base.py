@@ -9,7 +9,6 @@ Observation = dict
 class EnvInfo:
     task_id: str
     instruction: str
-    env_type: str
     max_steps: int
     extra: dict = field(default_factory=dict)
 
@@ -25,5 +24,4 @@ class Environment(ABC):
     @abstractmethod
     def step(self, action: dict) -> tuple[Observation, float, bool, dict]: ...
 
-    def close(self):
-        pass
+    def close(self): ...

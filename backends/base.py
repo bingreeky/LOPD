@@ -1,6 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import Optional
 
+import torch
+
+DEFAULT_MAX_RETRIES = 2
+
 
 class BaseLLM(ABC):
 
@@ -8,5 +12,7 @@ class BaseLLM(ABC):
     async def __call__(
         self,
         messages: list[dict],
-        tools: Optional[list[dict]] = None,
+        *,
+        latent_embeds: Optional[torch.Tensor] = None,
+        lora_path: Optional[str] = None,
     ) -> dict: ...

@@ -1,0 +1,58 @@
+model_path: YOUR_MODEL_PATH
+
+llm:
+  type: sglang
+  model_path: YOUR_MODEL_PATH
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 20
+  max_tokens: 10000
+  max_retries: 2
+  enable_thinking: true
+  tp_size: 8
+  dtype: bfloat16
+  mem_fraction_static: 0.7
+  disable_radix_cache: true
+  enable_memory_saver: true
+  enable_deterministic_inference: true
+  sampling_seed: 42
+
+memory_bank:
+  index_path: YOUR_MEMORY_BANK_PATH
+  encoder_model: YOUR_EMBEDDING_MODEL_PATH
+  allow_self_retrieval: true
+
+datasets:
+  envscaler:
+    rl_scenario_path: YOUR_TRAIN_SCENARIO_PATH
+    env_meta_path: YOUR_ENV_META_PATH
+    max_steps: 30
+    concurrency: 32
+
+compressor:
+  checkpoint: YOUR_COLD_START_COMPRESSOR_DIR
+
+training:
+  checkpoint: null
+  run_name: null
+  seed: 42
+  num_steps: 100
+  batch_size: 32
+  n_retrieve: 3
+  lr: 0.00001
+  grad_clip: 1.0
+  top_k: 20
+  max_seq_len: 40000
+  gradient_checkpointing: true
+  save_every: 10
+  nproc: 8
+  workers_port: 29700
+  checkpoint_dir: YOUR_CHECKPOINT_DIR
+  tensorboard_dir: null
+  constraint:
+    enabled: true
+    margin_m: 0.05
+    anchor_lambda: 0.2
+    eta_beta: 0.5
+    lr_phi: 0.00001
+    beta_init: 0.0

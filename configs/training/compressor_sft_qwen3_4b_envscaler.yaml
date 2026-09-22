@@ -1,0 +1,50 @@
+model_path: YOUR_MODEL_PATH
+
+compressor:
+  checkpoint: null
+  qformer:
+    depth: 8
+    num_queries: 32
+    ff_mult: 4
+    share_layers: true
+  lora:
+    adapter_name: encoder
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+memory_bank:
+  index_path: YOUR_MEMORY_BANK_PATH
+  encoder_model: YOUR_EMBEDDING_MODEL_PATH
+  allow_self_retrieval: true
+
+data:
+  path: YOUR_SFT_DATASET_PATH
+  prompt_protocol: envscaler_v1
+
+training:
+  run_name: null
+  seed: 42
+  num_steps: 1000
+  batch_size: 8
+  train_mini_batch_size: 2
+  lr: 0.00001
+  qformer_grad_clip: 30.0
+  lora_grad_clip: 3.0
+  n_retrieve: 3
+  task_cond: true
+  enable_thinking: true
+  gradient_checkpointing: false
+  max_seq_len: 32768
+  qformer_device: cuda:0
+  save_every: 25
+  checkpoint_dir: YOUR_CHECKPOINT_DIR
+  tensorboard_dir: null

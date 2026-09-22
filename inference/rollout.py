@@ -1,13 +1,24 @@
-
 import asyncio
-import threading
+import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
-from interaction.react import ReActAgent
 from backends.base import BaseLLM
+from interaction.react import ReActAgent
 from interaction.runner import EpisodeResult, run_episode
+from interaction.spec import load_react_inference_spec
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EpisodeError:
+    task_id: str
+    instruction: str
+    error_type: str
+    error_message: str
 
 
 async def rollout(
@@ -15,83 +26,45 @@ async def rollout(
     tasks: list[dict],
     latent_memories: list[Optional[torch.Tensor]],
     env_builder,
-    concurrency: int = 1,
-    return_indices: bool = False,
-    inference_name: str = "envscaler",
-) -> list[EpisodeResult] | list[tuple[int, EpisodeResult]]:
-    assert len(tasks) == len(latent_memories)
+    concurrency: int,
+) -> list[EpisodeResult | EpisodeError]:
+    if len(tasks) != len(latent_memories):
+        raise ValueError("tasks and latent_memories must have the same length")
 
-    if concurrency <= 1:
-        return await _rollout_sequential(
-            llm, tasks, latent_memories, env_builder,
-            return_indices=return_indices, inference_name=inference_name,
-        )
-    return await _rollout_concurrent(
-        llm, tasks, latent_memories, env_builder, concurrency,
-        return_indices=return_indices, inference_name=inference_name,
-    )
-
-
-async def _rollout_sequential(llm, tasks, latent_memories, env_builder, return_indices=False,
-                              inference_name="envscaler"):
-    results = []
-    for i, (task, latent) in enumerate(zip(tasks, latent_memories)):
-        env = env_builder(task)
-        try:
-            agent = ReActAgent(llm=llm, env_type=task["env_type"], inference_name=inference_name)
-            result = await run_episode(env, agent, task["index"], latent_embeds=latent)
-            results.append((i, result) if return_indices else result)
-        except Exception as exc:
-            print(f"  rollout [{i+1}/{len(tasks)}] task {task.get('task_id','?')} ERROR: {exc}")
-        finally:
-            env.close()
-    return results
-
-
-async def _rollout_concurrent(llm, tasks, latent_memories, env_builder, concurrency, return_indices=False,
-                              inference_name="envscaler"):
-    actual = min(concurrency, len(tasks))
-    task_queue: asyncio.Queue[int] = asyncio.Queue()
+    queue: asyncio.Queue[int] = asyncio.Queue()
     for i in range(len(tasks)):
-        task_queue.put_nowait(i)
+        queue.put_nowait(i)
+    results: list[EpisodeResult | EpisodeError | None] = [None] * len(tasks)
+    specs = {env_type: load_react_inference_spec(env_type) for env_type in {task["env_type"] for task in tasks}}
+    finished = 0
 
-    collected: dict[int, EpisodeResult] = {}
-    counter = _AtomicCounter()
-
-    async def _worker():
+    async def worker() -> None:
+        nonlocal finished
         while True:
             try:
-                i = task_queue.get_nowait()
+                i = queue.get_nowait()
             except asyncio.QueueEmpty:
-                break
+                return
             task = tasks[i]
-            latent = latent_memories[i]
             env = env_builder(task)
             try:
-                agent = ReActAgent(llm=llm, env_type=task["env_type"], inference_name=inference_name)
-                result = await run_episode(env, agent, task["index"], latent_embeds=latent)
-                collected[i] = result
-                n = counter.increment()
-                print(f"  rollout [{n}/{len(tasks)}] task {task.get('task_id','?')} "
-                      f"reward={result.reward:.3f} steps={result.steps}", flush=True)
+                agent = ReActAgent(llm, specs[task["env_type"]])
+                result = await run_episode(env, agent, task["index"], latent_embeds=latent_memories[i])
+                results[i] = result
+                finished += 1
+                logger.info("[%d/%d] task %s: reward=%.3f steps=%d",
+                            finished, len(tasks), result.task_id, result.reward, result.steps)
             except Exception as exc:
-                n = counter.increment()
-                print(f"  rollout [{n}/{len(tasks)}] task {task.get('task_id','?')} ERROR: {exc}", flush=True)
+                results[i] = EpisodeError(
+                    task_id=str(task.get("task_id", "")),
+                    instruction=str(task.get("instruction", "")),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:500],
+                )
+                finished += 1
+                logger.error("[%d/%d] task %s failed: %s", finished, len(tasks), task.get("task_id", "?"), exc)
             finally:
                 env.close()
 
-    await asyncio.gather(*[_worker() for _ in range(actual)])
-    if return_indices:
-        return [(i, collected[i]) for i in range(len(tasks)) if i in collected]
-    return [collected[i] for i in range(len(tasks)) if i in collected]
-
-
-class _AtomicCounter:
-    def __init__(self):
-        self._value = 0
-        self._lock = threading.Lock()
-
-    def increment(self) -> int:
-        with self._lock:
-            self._value += 1
-            return self._value
+    await asyncio.gather(*[worker() for _ in range(max(1, min(concurrency, len(tasks))))])
+    return results

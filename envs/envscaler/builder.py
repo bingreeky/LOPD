@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from typing import Callable, List
@@ -19,34 +18,14 @@ def build_envscaler_tasks(samples: List[dict]) -> List[dict]:
     ]
 
 
-def build_envscaler_env_builder(
-    samples: List[dict],
-    *,
-    max_steps: int = 30,
-    tool_protocol: str = "qwen3",
-) -> Callable[[dict], EnvScalerEnv]:
+def build_envscaler_env_builder(samples: List[dict], *, max_steps: int) -> Callable[[dict], EnvScalerEnv]:
     def _builder(_task: dict) -> EnvScalerEnv:
-        return EnvScalerEnv(
-            samples,
-            max_steps=max_steps,
-            tool_protocol=tool_protocol,
-        )
+        return EnvScalerEnv(samples, max_steps=max_steps)
 
     return _builder
 
 
-def load_rollout_setup(
-    rl_scenario_path: str,
-    env_meta_path: str,
-    *,
-    max_steps: int = 30,
-    tool_protocol: str = "qwen3",
-):
-    samples = load_envscaler_samples(rl_scenario_path, env_meta_path)
-    tasks = build_envscaler_tasks(samples)
-    env_builder = build_envscaler_env_builder(
-        samples,
-        max_steps=max_steps,
-        tool_protocol=tool_protocol,
-    )
-    return samples, tasks, env_builder
+def load_rollout_setup(env_cfg: dict) -> tuple[List[dict], Callable[[dict], EnvScalerEnv]]:
+    samples = load_envscaler_samples(env_cfg["rl_scenario_path"], env_cfg["env_meta_path"])
+    env_builder = build_envscaler_env_builder(samples, max_steps=int(env_cfg["max_steps"]))
+    return build_envscaler_tasks(samples), env_builder

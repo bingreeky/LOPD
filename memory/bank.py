@@ -1,4 +1,3 @@
-
 import hashlib
 import json
 import logging
@@ -17,13 +16,10 @@ class MemoryBank:
     def __init__(
         self,
         encoder_model: str | None = None,
-        device: str = "cpu",
         allow_self_retrieval: bool = False,
     ):
         self._encoder_model = encoder_model
-        self._encoder_device = device
         self._encoder: Optional[SentenceTransformer] = None
-        self._query_prompt_name: Optional[str] = None
         self.allow_self_retrieval = allow_self_retrieval
         self.entries: list[dict] = []
         self.embeddings: Optional[np.ndarray] = None
@@ -35,14 +31,8 @@ class MemoryBank:
     def encoder(self) -> SentenceTransformer:
         if self._encoder is None:
             if self._encoder_model is None:
-                raise RuntimeError(
-                    "encoder_model is required when query cache is unavailable. "
-                    "Pass encoder_model to MemoryBank() or pre-compute the query cache."
-                )
-            self._encoder = SentenceTransformer(
-                self._encoder_model, device=self._encoder_device,
-            )
-            self._query_prompt_name = None
+                raise RuntimeError("encoder_model is required when the query cache is unavailable")
+            self._encoder = SentenceTransformer(self._encoder_model)
         return self._encoder
 
     def add(self, instruction: str, trajectory, success: bool) -> None:
@@ -73,8 +63,7 @@ class MemoryBank:
             misses: list[str] = []
             miss_indices: list[int] = []
             for i, text in enumerate(texts):
-                key = hashlib.sha256(text.encode()).hexdigest()[:16]
-                row = self._query_cache_index.get(key)
+                row = self._query_cache_index.get(_query_key(text))
                 if row is not None:
                     result[i] = self._query_cache_embs[row]
                 else:
@@ -87,33 +76,13 @@ class MemoryBank:
                 )
                 miss_embs = self.encoder.encode(
                     misses, normalize_embeddings=True,
-                    prompt_name=self._query_prompt_name,
                 ).astype("float32")
                 for j, idx in enumerate(miss_indices):
                     result[idx] = miss_embs[j]
             return result
         return self.encoder.encode(
             texts, normalize_embeddings=True,
-            prompt_name=self._query_prompt_name,
         ).astype("float32")
-
-    def retrieve(self, query: str, k: int = 3) -> list[dict]:
-        if self.index is None:
-            raise RuntimeError("Index not built. Call build_index first.")
-        query_emb = self._encode_queries([query])
-        fetch_k = min(k + 10, self.index.ntotal)
-        scores, indices = self.index.search(query_emb, fetch_k)
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
-                continue
-            entry = self.entries[idx]
-            if not self.allow_self_retrieval and entry["instruction"] == query:
-                continue
-            results.append({**entry, "score": float(score)})
-            if len(results) >= k:
-                break
-        return results
 
     def retrieve_many(self, queries: list[str], k: int = 3) -> list[list[dict]]:
         if self.index is None:
@@ -141,12 +110,10 @@ class MemoryBank:
     def build_query_cache(self, query_texts: list[str], save_dir: str) -> None:
         embs = self.encoder.encode(
             query_texts, show_progress_bar=True, normalize_embeddings=True,
-            prompt_name=self._query_prompt_name,
         ).astype("float32")
         index_map: dict[str, int] = {}
         for i, text in enumerate(query_texts):
-            key = hashlib.sha256(text.encode()).hexdigest()[:16]
-            index_map[key] = i
+            index_map[_query_key(text)] = i
         os.makedirs(save_dir, exist_ok=True)
         np.save(os.path.join(save_dir, "query_cache.npy"), embs)
         with open(os.path.join(save_dir, "query_cache_index.json"), "w") as f:
@@ -187,7 +154,6 @@ class MemoryBank:
 
     def load(self, path: str) -> None:
         self.index = faiss.read_index(os.path.join(path, "index.faiss"))
-        self.embeddings = np.load(os.path.join(path, "embeddings.npy"))
         with open(os.path.join(path, "meta.json")) as f:
             meta = json.load(f)
         with open(os.path.join(path, "trajectories.jsonl")) as f:
@@ -197,3 +163,7 @@ class MemoryBank:
         ]
         self.load_query_cache(path)
         logger.info("Loaded memory bank from %s (%d entries)", path, len(self.entries))
+
+
+def _query_key(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]

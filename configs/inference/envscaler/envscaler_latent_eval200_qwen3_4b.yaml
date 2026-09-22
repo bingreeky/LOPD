@@ -1,5 +1,3 @@
-model_path: YOUR_MODEL_PATH
-
 llm:
   type: sglang
   model_path: YOUR_MODEL_PATH
@@ -7,6 +5,7 @@ llm:
   top_p: 0.95
   top_k: 20
   max_tokens: 10000
+  max_retries: 2
   enable_thinking: true
   tp_size: 8
   dtype: bfloat16
@@ -16,32 +15,13 @@ llm:
   enable_return_hidden_states: true
   sampling_seed: 42
 
-qformer:
-  depth: 8
-  num_queries: 32
-  ff_mult: 4
-  share_layers: true
+compressor:
   checkpoint: YOUR_COMPRESSOR_CHECKPOINT
 
-lora:
-  enabled: true
-  adapter_name: encoder
-  rank: 8
-  alpha: 16
-  pinned: true
-  target_modules:
-    - q_proj
-    - k_proj
-    - v_proj
-    - o_proj
-    - gate_proj
-    - up_proj
-    - down_proj
-
 inference:
-  n_retrieve: 1
+  n_retrieve: 3
   task_cond: true
-  prompt_protocol: envscaler_v1
+  qformer_device: cuda:0
 
 memory_bank:
   index_path: YOUR_MEMORY_BANK_PATH
